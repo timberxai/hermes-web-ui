@@ -163,10 +163,6 @@ function isNumericQuery(text: string): boolean {
   return /^\d+(?:\s+\d+)*$/.test(text.trim())
 }
 
-function hasUnsafeChars(text: string): boolean {
-  return /[^\w\s\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(text)
-}
-
 function runLikeContentSearch(
   db: { prepare: (sql: string) => { all: (...params: any[]) => Record<string, unknown>[] } },
   source: string | undefined,
@@ -362,7 +358,7 @@ export async function searchSessionSummaries(
       return [...merged.values()].slice(0, limit)
     }
 
-    if (isNumericQuery(trimmed) || hasUnsafeChars(trimmed)) {
+    if (message.includes('no such table: messages_fts') && isNumericQuery(trimmed)) {
       const likeRows = runLikeContentSearch(db, source, trimmed)
       const merged = new Map<string, HermesSessionSearchRow>()
       for (const row of titleRows) {
