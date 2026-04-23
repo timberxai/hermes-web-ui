@@ -21,6 +21,7 @@ import { nousAuthRoutes } from './hermes/nous-auth'
 import { gatewayRoutes } from './hermes/gateways'
 import { weixinRoutes } from './hermes/weixin'
 import { proxyRoutes, proxyMiddleware } from './hermes/proxy'
+import { groupChatRoutes, setGroupChatServer } from './hermes/group-chat'
 
 /**
  * Register all routes on the Koa app.
@@ -52,6 +53,7 @@ export function registerRoutes(app: any, requireAuth: (ctx: Context, next: Next)
   app.use(nousAuthRoutes.routes())
   app.use(gatewayRoutes.routes())
   app.use(weixinRoutes.routes())
+  app.use(groupChatRoutes.routes())       // Must be before proxy
   app.use(proxyRoutes.routes())
 
   // Proxy catch-all middleware (must be last)
