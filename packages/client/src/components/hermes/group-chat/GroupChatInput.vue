@@ -197,25 +197,6 @@ function handleCompositionEnd() {
 
 <template>
     <div class="chat-input-area">
-        <div v-if="store.contextStatus" class="context-status">
-            <svg class="context-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="10" />
-                <path v-if="store.contextStatus.status === 'compressing'" d="M12 6v6l4 2" />
-                <path v-else d="M9 12l2 2 4-4" />
-            </svg>
-            <span v-if="store.contextStatus.status === 'compressing'">
-                @{{ store.contextStatus.agentName }} is compressing context...
-            </span>
-            <span v-else>
-                @{{ store.contextStatus.agentName }} is replying...
-            </span>
-        </div>
-        <div v-if="store.typingText && !store.contextStatus" class="typing-indicator">
-            <span class="typing-dots">
-                <span /><span /><span />
-            </span>
-            {{ store.typingText }}
-        </div>
         <div class="input-wrapper">
             <textarea
                 ref="textareaRef"
@@ -260,44 +241,9 @@ function handleCompositionEnd() {
 @use "@/styles/variables" as *;
 
 .chat-input-area {
-    padding: 12px 20px 16px;
+    padding: 20px 20px 16px;
     border-top: 1px solid $border-color;
     flex-shrink: 0;
-}
-
-.typing-indicator {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0 4px 8px;
-    font-size: 12px;
-    color: $text-muted;
-}
-
-.context-status {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
-    margin-bottom: 4px;
-    font-size: 12px;
-    color: $text-secondary;
-    background-color: $bg-hover;
-    border-radius: $radius-sm;
-
-    .dark & {
-        background-color: rgba(255, 255, 255, 0.06);
-    }
-}
-
-.context-icon {
-    flex-shrink: 0;
-    animation: context-pulse 1.5s infinite;
-}
-
-@keyframes context-pulse {
-    0%, 100% { opacity: 0.5; }
-    50% { opacity: 1; }
 }
 
 .typing-dots {

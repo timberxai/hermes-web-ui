@@ -4,6 +4,8 @@ import {
     connectGroupChat,
     disconnectGroupChat,
     getSocket,
+    getStoredUserId,
+    getStoredUserName,
     type RoomInfo,
     type RoomAgent,
     type ChatMessage,
@@ -16,6 +18,8 @@ import {
     addAgent,
     listAgents,
     removeAgent,
+    deleteRoom as deleteRoomApi,
+    updateRoomConfig,
 } from '@/api/hermes/group-chat'
 
 export const useGroupChatStore = defineStore('groupChat', () => {
@@ -30,7 +34,17 @@ export const useGroupChatStore = defineStore('groupChat', () => {
     const isJoining = ref(false)
     const error = ref<string | null>(null)
     const typingUsers = ref<Map<string, { name: string; timer: ReturnType<typeof setTimeout> }>>(new Map())
-    const contextStatus = ref<{ agentName: string; status: string } | null>(null)
+    const contextStatuses = ref<Map<string, { agentName: string; status: string }>>(new Map())
+
+    // Computed: returns first active status for backward compat
+    const contextStatus = computed(() => {
+        for (const [, status] of contextStatuses.value) {
+            return status
+        }
+        return null
+    })
+    const userId = ref(getStoredUserId())
+    const userName = ref(getStoredUserName() || '')
 
     // ─── Computed ───────────────────────────────────────────
     const sortedMessages = computed(() => {
@@ -55,8 +69,11 @@ export const useGroupChatStore = defineStore('groupChat', () => {
 
     // ─── Connection ────────────────────────────────────────
     function connect() {
-        const socket = connectGroupChat()
-        console.log('[GroupChat] connecting...')
+        const socket = connectGroupChat({
+            userId: userId.value,
+            userName: userName.value || undefined,
+        })
+        console.log('[GroupChat] connecting...', { userId: userId.value, userName: userName.value })
 
         socket.on('connect', () => {
             console.log('[GroupChat] connected, socket id:', socket.id)
@@ -111,11 +128,18 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         socket.on('context_status', (data: { roomId: string; agentName: string; status: string }) => {
             if (data.roomId === currentRoomId.value) {
                 if (data.status === 'ready') {
-                    contextStatus.value = null
+                    contextStatuses.value.delete(data.agentName)
                 } else {
-                    contextStatus.value = { agentName: data.agentName, status: data.status }
+                    contextStatuses.value.set(data.agentName, { agentName: data.agentName, status: data.status })
                 }
+                // Trigger reactivity
+                contextStatuses.value = new Map(contextStatuses.value)
             }
+        })
+
+        socket.on('room_updated', (data: { roomId: string; totalTokens: number }) => {
+            const room = rooms.value.find(r => r.id === data.roomId)
+            if (room) room.totalTokens = data.totalTokens
         })
     }
 
@@ -128,7 +152,13 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         agents.value = []
         roomName.value = ''
         typingUsers.value.clear()
-        contextStatus.value = null
+        contextStatuses.value.clear()
+    }
+
+    function setUserInfo(name: string, description: string) {
+        userName.value = name
+        localStorage.setItem('gc_user_name', name)
+        localStorage.setItem('gc_user_description', description)
     }
 
     // ─── Room Actions ──────────────────────────────────────
@@ -142,6 +172,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             roomName.value = res.room.name
             messages.value = res.messages
             agents.value = res.agents
+            members.value = res.members || []
         } catch (err: any) {
             error.value = err.message
             throw err
@@ -153,9 +184,10 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         const socket = getSocket()
         if (socket) {
             await new Promise<void>((resolve) => {
-                socket.emit('join', { roomId }, (res: any) => {
+                socket.emit('join', { roomId, name: userName.value || undefined }, (res: any) => {
                     if (!res?.error) {
                         members.value = res.members || []
+                        if (res.agents) agents.value = res.agents
                     }
                     resolve()
                 })
@@ -188,9 +220,14 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         }
     }
 
-    async function createNewRoom(name: string, inviteCode: string, agentList?: { profile: string; name?: string; description?: string; invited?: boolean }[]) {
+    async function createNewRoom(name: string, inviteCode: string, agentList?: { profile: string; name?: string; description?: string; invited?: boolean }[], compression?: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }) {
         try {
-            const res = await createRoom({ name, inviteCode, agents: agentList })
+            const res = await createRoom({
+                name,
+                inviteCode,
+                agents: agentList,
+                compression: compression || { triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 20 },
+            })
             rooms.value.push(res.room)
             return res
         } catch (err: any) {
@@ -204,6 +241,23 @@ export const useGroupChatStore = defineStore('groupChat', () => {
             const res = await joinRoomByCode(code)
             await joinRoom(res.room.id)
             return res.room
+        } catch (err: any) {
+            error.value = err.message
+            throw err
+        }
+    }
+
+    async function deleteRoom(roomId: string) {
+        try {
+            await deleteRoomApi(roomId)
+            rooms.value = rooms.value.filter(r => r.id !== roomId)
+            if (currentRoomId.value === roomId) {
+                currentRoomId.value = null
+                messages.value = []
+                members.value = []
+                agents.value = []
+                roomName.value = ''
+            }
         } catch (err: any) {
             error.value = err.message
             throw err
@@ -269,6 +323,9 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         isJoining,
         error,
         contextStatus,
+        contextStatuses,
+        userId,
+        userName,
         // Computed
         sortedMessages,
         memberNames,
@@ -277,6 +334,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         // Actions
         connect,
         disconnect,
+        setUserInfo,
         joinRoom,
         sendMessage,
         loadRooms,
@@ -284,6 +342,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
         emitStopTyping,
         createNewRoom,
         joinByCode,
+        deleteRoom,
         loadAgents,
         addAgentToRoom,
         removeAgentFromRoom,

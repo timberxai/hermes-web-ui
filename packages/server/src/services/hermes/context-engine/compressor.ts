@@ -5,9 +5,9 @@ import type {
     BuildContextInput,
     MessageFetcher,
     GatewayCaller,
+    SessionCleaner,
 } from './types'
 import { DEFAULT_COMPRESSION_CONFIG } from './types'
-import { SummaryCache } from './summary-cache'
 import { GatewaySummarizer } from './gateway-client'
 import { buildAgentInstructions, buildSummarizationSystemPrompt } from './prompt'
 
@@ -15,154 +15,295 @@ export class ContextEngine {
     private config: CompressionConfig
     private messageFetcher: MessageFetcher
     private gatewayCaller: GatewayCaller
-    private cache: SummaryCache
+    /** Per-room compression lock to prevent concurrent snapshot overwrites */
+    private _compressLocks = new Map<string, Promise<void>>()
+    private _upstream = ''
+    private _apiKey: string | null = null
 
     constructor(opts: {
         config?: Partial<CompressionConfig>
         messageFetcher: MessageFetcher
         gatewayCaller?: GatewayCaller
+        sessionCleaner?: SessionCleaner
     }) {
         this.config = { ...DEFAULT_COMPRESSION_CONFIG, ...opts.config }
         this.messageFetcher = opts.messageFetcher
         this.gatewayCaller = opts.gatewayCaller || new GatewaySummarizer(this.config.summarizationTimeoutMs)
-        this.cache = new SummaryCache(this.config.summaryTtlMs)
+        this.sessionCleaner = opts.sessionCleaner
     }
 
-    async buildContext(input: BuildContextInput): Promise<CompressedContext> {
-        const allMessages = this.messageFetcher.getMessages(input.roomId)
+    private sessionCleaner?: SessionCleaner
 
+    setUpstream(upstream: string, apiKey: string | null): void {
+        this._upstream = upstream
+        this._apiKey = apiKey
+    }
+
+    /**
+     * Build context for an agent reply.
+     *
+     * Flow:
+     * 1. Read persisted snapshot (summary + lastMessageId) from SQLite
+     * 2. If snapshot exists:
+     *    a. Collect new messages after lastMessageId
+     *    b. Estimate tokens = summary + new messages
+     *    c. Under threshold → return as-is
+     *    d. Over threshold → incremental compress, update snapshot, return
+     * 3. If no snapshot:
+     *    a. Estimate tokens for all messages
+     *    b. Under threshold → return all verbatim
+     *    c. Over threshold → full compress, save snapshot, return
+     */
+    async buildContext(input: BuildContextInput): Promise<CompressedContext> {
+        // Serialize compression per room to prevent concurrent snapshot overwrites
+        const existing = this._compressLocks.get(input.roomId)
+        if (existing) {
+            await existing
+        }
+        let resolveLock!: () => void
+        const lock = new Promise<void>(r => { resolveLock = r })
+        this._compressLocks.set(input.roomId, lock)
+        try {
+            return await this._buildContextImpl(input)
+        } finally {
+            resolveLock()
+            this._compressLocks.delete(input.roomId)
+        }
+    }
+
+    private async _buildContextImpl(input: BuildContextInput): Promise<CompressedContext> {
+        const config = { ...this.config, ...input.compression }
+        const allMessages = this.messageFetcher.getMessages(input.roomId)
         // Filter out messages newer than the current one
         const messages = allMessages.filter(m => m.timestamp <= input.currentMessage.timestamp)
         const total = messages.length
-        const totalTokens = this.estimateTokensFromMessages(messages)
 
-        const meta: CompressedContext['meta'] = {
-            totalMessages: total,
-            summarizedCount: 0,
-            verbatimHeadCount: 0,
-            verbatimTailCount: 0,
-            summaryTokenEstimate: 0,
-            cacheHit: false,
-        }
+        console.log(`[ContextEngine] buildContext START — room=${input.roomId}, agent=${input.agentName}, totalMessagesInDb=${allMessages.length}, afterFilter=${total}`)
 
         const instructions = buildAgentInstructions({
             agentName: input.agentName,
             roomName: input.roomName,
             agentDescription: input.agentDescription,
             memberNames: input.memberNames,
+            members: input.members,
         })
 
-        const { triggerTokens, headMessageCount, tailMessageCount } = this.config
+        const meta: CompressedContext['meta'] = {
+            totalMessages: total,
+            verbatimCount: 0,
+            hadSnapshot: false,
+            compressed: false,
+            summaryTokenEstimate: 0,
+        }
 
-        // Under token threshold — pass all messages verbatim
-        if (totalTokens <= triggerTokens) {
-            const history = messages.map(m => this.mapToHistory(m, input.agentSocketId))
+        const snapshot = this.messageFetcher.getContextSnapshot(input.roomId)
+        console.log(`[ContextEngine] snapshot=${snapshot ? `EXISTS (lastMsgId=${snapshot.lastMessageId}, summaryLen=${snapshot.summary.length})` : 'NONE'}`)
+
+        // ── Path A: Snapshot exists — incremental ────────────
+        if (snapshot) {
+            meta.hadSnapshot = true
+
+            // Find the position of lastMessageId in messages
+            const snapshotIdx = messages.findIndex(m => m.id === snapshot.lastMessageId)
+            // Collect messages after the snapshot position
+            const newMessages = snapshotIdx >= 0
+                ? messages.slice(snapshotIdx + 1)
+                : messages.filter(m => m.timestamp > snapshot.lastMessageTimestamp)
+
+            const summaryTokens = this.countTokens(snapshot.summary)
+            const newTokens = this.estimateTokensFromMessages(newMessages)
+            const totalTokens = summaryTokens + newTokens
+
+            meta.verbatimCount = newMessages.length
+            meta.summaryTokenEstimate = summaryTokens
+
+            console.log(`[ContextEngine] [Path A] snapshotIdx=${snapshotIdx}, newMessages=${newMessages.length}, summaryTokens=~${summaryTokens}, newTokens=~${newTokens}, totalTokens=~${totalTokens}, threshold=${config.triggerTokens}`)
+            console.log(`[ContextEngine] [Path A] EXISTING SUMMARY (${snapshot.summary.length} chars):`, snapshot.summary.slice(0, 300))
+            if (newMessages.length > 0) {
+                console.log(`[ContextEngine] [Path A] NEW MESSAGES (${newMessages.length}):`, newMessages.map(m => `[${m.senderName}]: ${m.content.slice(0, 80)}`).join(' | '))
+            }
+
+            // Under threshold — return summary + new messages directly
+            if (totalTokens <= config.triggerTokens) {
+                console.log(`[ContextEngine] [Path A] UNDER threshold — return summary + ${newMessages.length} verbatim msgs directly`)
+                const history = this.buildHistory(snapshot.summary, newMessages, input.agentSocketId)
+                this.logHistory('Path A (no compress)', history)
+                return { conversationHistory: history, instructions, meta }
+            }
+
+            // Over threshold — incremental compress
+            console.log(`[ContextEngine] [Path A] OVER threshold — starting INCREMENTAL compression of ${newMessages.length} msgs...`)
+            console.log(`[ContextEngine] [Path A] CONTEXT BEFORE COMPRESSION: summary(${snapshot.summary.length} chars) + ${newMessages.length} new msgs`)
+            meta.compressed = true
+
+            const t0 = Date.now()
+            const result = await this.summarize(
+                input.roomId,
+                newMessages,
+                input.upstream,
+                input.apiKey,
+                snapshot.summary,
+            )
+            const elapsed = Date.now() - t0
+
+            if (result.summary) {
+                const lastMsg = newMessages[newMessages.length - 1]
+                this.messageFetcher.saveContextSnapshot(input.roomId, result.summary, lastMsg.id, lastMsg.timestamp)
+
+                meta.summaryTokenEstimate = this.countTokens(result.summary)
+                console.log(`[ContextEngine] [Path A] incremental compression DONE in ${elapsed}ms, newSummaryLen=${result.summary.length}, newLastMsgId=${lastMsg.id}`)
+                console.log(`[ContextEngine] [Path A] NEW SUMMARY (${result.summary.length} chars):`, result.summary.slice(0, 300))
+                const history = this.buildHistory(result.summary, newMessages, input.agentSocketId)
+                this.logHistory('Path A (after incremental compress)', history)
+                if (result.sessionId) this.sessionCleaner?.(result.sessionId)
+                return { conversationHistory: history, instructions, meta }
+            }
+
+            // Compression failed — degrade
+            console.warn(`[ContextEngine] [Path A] incremental compression FAILED (${elapsed}ms) — degrading to summary + trimmed verbatim`)
+            const history = this.buildHistory(snapshot.summary, newMessages, input.agentSocketId)
+            this.trimToBudget(history, summaryTokens, config.maxHistoryTokens)
             return { conversationHistory: history, instructions, meta }
         }
 
-        // Over threshold — three-zone split
-        const head = messages.slice(0, headMessageCount)
-        const tail = messages.slice(-tailMessageCount)
-        const middle = messages.slice(headMessageCount, -tailMessageCount)
+        // ── Path B: No snapshot — full context ───────────────
+        const totalTokens = this.estimateTokensFromMessages(messages)
+        meta.verbatimCount = total
 
-        meta.verbatimHeadCount = head.length
-        meta.verbatimTailCount = tail.length
-        meta.summarizedCount = middle.length
+        console.log(`[ContextEngine] [Path B] no snapshot, totalMessages=${total}, totalTokens=~${totalTokens}, threshold=${config.triggerTokens}`)
 
-        console.log(`[ContextEngine] ${input.agentName}: ${total} msgs, ~${totalTokens} tokens > ${triggerTokens}, compressing ${middle.length} middle msgs`)
-
-        // Attempt summarization
-        let summaryContent: string | null = null
-
-        try {
-            summaryContent = await this.summarizeMiddle(
-                input.roomId,
-                middle,
-                input.upstream,
-                input.apiKey,
-            )
-        } catch (err: any) {
-            console.warn(`[ContextEngine] Summarization failed for ${input.agentName} in ${input.roomId}: ${err.message}`)
-            // Degrade: skip middle, keep head + tail only
+        // Under threshold — pass all messages verbatim
+        if (totalTokens <= config.triggerTokens) {
+            console.log(`[ContextEngine] [Path B] UNDER threshold — return all ${total} msgs verbatim`)
+            const history = messages.map(m => this.mapToHistory(m, input.agentSocketId))
+            this.logHistory('Path B (no compress)', history)
+            return { conversationHistory: history, instructions, meta }
         }
 
-        // Assemble history
-        const history: Array<{ role: 'user' | 'assistant'; content: string }> = []
+        // Over threshold — full compress
+        console.log(`[ContextEngine] [Path B] OVER threshold — starting FULL compression of ${total} msgs...`)
+        console.log(`[ContextEngine] [Path B] CONTEXT BEFORE COMPRESSION: ${total} msgs, ~${totalTokens} tokens`)
+        meta.compressed = true
 
-        if (summaryContent) {
-            history.push(
-                { role: 'user', content: '[Previous conversation summary for context]\n' + summaryContent },
-                { role: 'assistant', content: 'I have reviewed the conversation history and understand the context.' },
-            )
-            meta.summaryTokenEstimate = Math.ceil(summaryContent.length / this.config.charsPerToken)
+        const t0 = Date.now()
+        const result = await this.summarize(
+            input.roomId,
+            messages,
+            input.upstream,
+            input.apiKey,
+        )
+        const elapsed = Date.now() - t0
+
+        if (result.summary) {
+            // Keep recent tail messages verbatim, compress the rest
+            const { tailMessageCount } = config
+            const toCompress = messages.length > tailMessageCount ? messages.slice(0, -tailMessageCount) : messages
+            const tail = messages.length > tailMessageCount ? messages.slice(-tailMessageCount) : []
+            const lastCompressedMsg = toCompress[toCompress.length - 1]
+
+            this.messageFetcher.saveContextSnapshot(input.roomId, result.summary, lastCompressedMsg.id, lastCompressedMsg.timestamp)
+
+            meta.summaryTokenEstimate = this.countTokens(result.summary)
+            console.log(`[ContextEngine] [Path B] full compression DONE in ${elapsed}ms, summaryLen=${result.summary.length}, compressed=${toCompress.length} msgs, keptTail=${tail.length} msgs, savedLastMsgId=${lastCompressedMsg.id}`)
+            console.log(`[ContextEngine] [Path B] COMPRESSED SUMMARY (${result.summary.length} chars):`, result.summary.slice(0, 300))
+            const history = this.buildHistory(result.summary, tail, input.agentSocketId)
+            this.logHistory('Path B (after full compress)', history)
+            if (result.sessionId) this.sessionCleaner?.(result.sessionId)
+            return { conversationHistory: history, instructions, meta }
         }
 
-        history.push(...head.map(m => this.mapToHistory(m, input.agentSocketId)))
-        history.push(...tail.map(m => this.mapToHistory(m, input.agentSocketId)))
-
-        // Token budget trimming
-        this.trimToBudget(history, meta.summaryTokenEstimate)
-
+        // Compression failed — degrade
+        console.warn(`[ContextEngine] [Path B] full compression FAILED (${elapsed}ms) — degrading to trimmed verbatim`)
+        const history = messages.map(m => this.mapToHistory(m, input.agentSocketId))
+        this.trimToBudget(history, 0, config.maxHistoryTokens)
+        meta.verbatimCount = history.length
         return { conversationHistory: history, instructions, meta }
     }
 
     invalidateRoom(roomId: string): void {
-        this.cache.invalidate(roomId)
+        this.messageFetcher.deleteContextSnapshot(roomId)
+    }
+
+    /**
+     * Force compress all messages in a room (full compression).
+     * Used when user manually triggers compression.
+     */
+    async forceCompress(roomId: string): Promise<string> {
+        const allMessages = this.messageFetcher.getMessages(roomId)
+        if (allMessages.length === 0) return ''
+
+        const config = { ...this.config }
+        console.log(`[ContextEngine] forceCompress room=${roomId}, messages=${allMessages.length}`)
+
+        const t0 = Date.now()
+        const result = await this.summarize(roomId, allMessages, this._upstream, this._apiKey)
+        const elapsed = Date.now() - t0
+
+        if (result.summary) {
+            const { tailMessageCount } = config
+            const toCompress = allMessages.length > tailMessageCount ? allMessages.slice(0, -tailMessageCount) : allMessages
+            const tail = allMessages.length > tailMessageCount ? allMessages.slice(-tailMessageCount) : []
+            const lastCompressedMsg = toCompress[toCompress.length - 1]
+
+            this.messageFetcher.saveContextSnapshot(roomId, result.summary, lastCompressedMsg.id, lastCompressedMsg.timestamp)
+            console.log(`[ContextEngine] forceCompress DONE in ${elapsed}ms`)
+            if (result.sessionId) this.sessionCleaner?.(result.sessionId)
+            return result.summary
+        }
+
+        throw new Error('Compression failed')
     }
 
     // ─── Private ─────────────────────────────────────────────
 
-    private async summarizeMiddle(
+    /**
+     * Build history array: optional summary prefix + verbatim messages.
+     */
+    private buildHistory(
+        summary: string,
+        messages: StoredMessage[],
+        agentSocketId: string,
+    ): Array<{ role: 'user' | 'assistant'; content: string }> {
+        const history: Array<{ role: 'user' | 'assistant'; content: string }> = []
+
+        if (summary) {
+            history.push(
+                { role: 'user', content: '[Previous conversation summary]\n' + summary },
+                { role: 'assistant', content: 'I have reviewed the conversation history and understand the context.' },
+            )
+        }
+
+        history.push(...messages.map(m => this.mapToHistory(m, agentSocketId)))
+        return history
+    }
+
+    /**
+     * Summarize messages. If previousSummary is provided, do incremental update.
+     */
+    private async summarize(
         roomId: string,
-        middle: StoredMessage[],
+        messages: StoredMessage[],
         upstream: string,
         apiKey: string | null,
-    ): Promise<string | null> {
-        const cached = this.cache.get(roomId)
+        previousSummary?: string,
+    ): Promise<{ summary: string | null; sessionId: string | null }> {
+        if (messages.length === 0 && !previousSummary) return { summary: null, sessionId: null }
 
-        if (cached) {
-            // Check if there are new messages since last summary
-            const newMessages = middle.filter(m => m.timestamp > cached.lastSummarizedTimestamp)
-            if (newMessages.length === 0) {
-                // Cache hit, no new messages
-                return cached.summaryContent
-            }
-
-            // Incremental update with new messages only
-            const summary = await this.gatewayCaller.summarize(
+        try {
+            const result = await this.gatewayCaller.summarize(
                 upstream,
                 apiKey,
                 buildSummarizationSystemPrompt(),
-                newMessages,
-                cached.summaryContent,
+                messages,
+                previousSummary,
             )
-
-            this.cache.set(roomId, {
-                summaryContent: summary,
-                lastSummarizedTimestamp: newMessages[newMessages.length - 1].timestamp,
-                createdAt: Date.now(),
-                messageCountAtCreation: middle.length,
-            })
-
-            return summary
+            return { summary: result.summary, sessionId: result.sessionId }
+        } catch (err: any) {
+            console.warn(`[ContextEngine] Summarization failed for room ${roomId}: ${err.message}`)
+            return { summary: null, sessionId: null }
+        } finally {
+            // Session cleanup handled here if sessionCleaner is provided
         }
-
-        // Cache miss — full summarization
-        const summary = await this.gatewayCaller.summarize(
-            upstream,
-            apiKey,
-            buildSummarizationSystemPrompt(),
-            middle,
-        )
-
-        this.cache.set(roomId, {
-            summaryContent: summary,
-            lastSummarizedTimestamp: middle[middle.length - 1].timestamp,
-            createdAt: Date.now(),
-            messageCountAtCreation: middle.length,
-        })
-
-        return summary
     }
 
     private mapToHistory(
@@ -178,10 +319,10 @@ export class ContextEngine {
     private trimToBudget(
         history: Array<{ role: 'user' | 'assistant'; content: string }>,
         summaryTokens: number,
+        maxTokens: number,
     ): void {
         let totalTokens = summaryTokens + this.estimateTokens(history)
-        // Trim from the end (tail messages) while preserving head + summary
-        while (totalTokens > this.config.maxHistoryTokens && history.length > 0) {
+        while (totalTokens > maxTokens && history.length > 0) {
             history.pop()
             totalTokens = summaryTokens + this.estimateTokens(history)
         }
@@ -202,5 +343,15 @@ export class ContextEngine {
         const cjk = (text.match(/[\u2e80-\u9fff\uac00-\ud7af\u3000-\u303f\uff00-\uffef]/g) || []).length
         const other = text.length - cjk
         return Math.ceil(cjk * 1.5 + other / 4)
+    }
+
+    /** Log assembled history for debugging */
+    private logHistory(label: string, history: Array<{ role: string; content: string }>): void {
+        const totalTokens = this.estimateTokens(history)
+        console.log(`[ContextEngine] ASSEMBLED HISTORY (${label}): ${history.length} entries, ~${totalTokens} tokens`)
+        for (const entry of history) {
+            const preview = entry.content.length > 150 ? entry.content.slice(0, 150) + '...' : entry.content
+            console.log(`  [${entry.role}] ${preview}`)
+        }
     }
 }

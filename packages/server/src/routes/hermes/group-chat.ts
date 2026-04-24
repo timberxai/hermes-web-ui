@@ -21,10 +21,11 @@ groupChatRoutes.post('/api/hermes/group-chat/rooms', async (ctx) => {
         return
     }
 
-    const { name, inviteCode, agents } = ctx.request.body as {
+    const { name, inviteCode, agents, compression } = ctx.request.body as {
         name?: string
         inviteCode?: string
         agents?: { profile: string; name?: string; description?: string; invited?: boolean }[]
+        compression?: { triggerTokens?: number; maxHistoryTokens?: number; tailMessageCount?: number }
     }
     if (!name || !inviteCode) {
         ctx.status = 400
@@ -34,7 +35,7 @@ groupChatRoutes.post('/api/hermes/group-chat/rooms', async (ctx) => {
 
     const roomId = generateId()
     const storage = chatServer.getStorage()
-    storage.saveRoom(roomId, name, inviteCode)
+    storage.saveRoom(roomId, name, inviteCode, compression)
 
     // Save agents to DB and auto-connect via Socket.IO
     const addedAgents = []
@@ -77,7 +78,8 @@ groupChatRoutes.get('/api/hermes/group-chat/rooms/:roomId', async (ctx) => {
 
     const messages = chatServer.getStorage().getMessages(ctx.params.roomId)
     const agents = chatServer.getStorage().getRoomAgents(ctx.params.roomId)
-    ctx.body = { room, messages, agents }
+    const members = chatServer.getStorage().getRoomMembers(ctx.params.roomId)
+    ctx.body = { room, messages, agents, members }
 })
 
 // List rooms
@@ -194,4 +196,71 @@ groupChatRoutes.delete('/api/hermes/group-chat/rooms/:roomId/agents/:agentId', a
     chatServer.getStorage().removeRoomAgent(ctx.params.agentId)
     chatServer.agentClients.removeAgentFromRoom(ctx.params.roomId, ctx.params.agentId)
     ctx.body = { success: true }
+})
+
+// Delete room
+groupChatRoutes.delete('/api/hermes/group-chat/rooms/:roomId', async (ctx) => {
+    if (!chatServer) {
+        ctx.status = 503
+        ctx.body = { error: 'Group chat not initialized' }
+        return
+    }
+
+    const roomId = ctx.params.roomId
+    // Disconnect all agents in room
+    chatServer.agentClients.disconnectRoom(roomId)
+    // Delete all data
+    chatServer.getStorage().deleteRoom(roomId)
+    ctx.body = { success: true }
+})
+
+// Update room compression config
+groupChatRoutes.put('/api/hermes/group-chat/rooms/:roomId/config', async (ctx) => {
+    if (!chatServer) {
+        ctx.status = 503
+        ctx.body = { error: 'Group chat not initialized' }
+        return
+    }
+
+    const roomId = ctx.params.roomId
+    const { triggerTokens, maxHistoryTokens, tailMessageCount } = ctx.request.body as {
+        triggerTokens?: number
+        maxHistoryTokens?: number
+        tailMessageCount?: number
+    }
+
+    chatServer.getStorage().updateRoomConfig(roomId, { triggerTokens, maxHistoryTokens, tailMessageCount })
+    const room = chatServer.getStorage().getRoom(roomId)
+    ctx.body = { room }
+})
+
+// Force compress a room's context
+groupChatRoutes.post('/api/hermes/group-chat/rooms/:roomId/compress', async (ctx) => {
+    if (!chatServer) {
+        ctx.status = 503
+        ctx.body = { error: 'Group chat not initialized' }
+        return
+    }
+
+    const roomId = ctx.params.roomId
+    if (!chatServer.getStorage().getRoom(roomId)) {
+        ctx.status = 404
+        ctx.body = { error: 'Room not found' }
+        return
+    }
+
+    const engine = chatServer.getContextEngine()
+    if (!engine) {
+        ctx.status = 503
+        ctx.body = { error: 'Context engine not available' }
+        return
+    }
+
+    try {
+        const result = await engine.forceCompress(roomId)
+        ctx.body = { success: true, summary: result }
+    } catch (err: any) {
+        ctx.status = 500
+        ctx.body = { error: err.message }
+    }
 })

@@ -181,8 +181,8 @@ class AgentClient {
 
     private async deleteSession(sessionId: string): Promise<void> {
         try {
-            const ok = await hermesDeleteSession(sessionId)
-            console.log(`[AgentClients] ${this.name}: delete session ${sessionId} → ${ok ? 'ok' : 'failed'}`)
+            const ok = await hermesDeleteSession(sessionId, this.profile)
+            console.log(`[AgentClients] ${this.name}: delete session ${sessionId} (profile=${this.profile}) → ${ok ? 'ok' : 'failed'}`)
         } catch (err: any) {
             console.warn(`[AgentClients] ${this.name}: failed to delete session ${sessionId}: ${err.message}`)
         }
@@ -197,7 +197,7 @@ class AgentClient {
      */
     async replyToMention(
         roomId: string,
-        msg: { content: string; senderName: string; senderId: string },
+        msg: { content: string; senderName: string; senderId: string; timestamp: number },
         onStatus?: (status: 'compressing' | 'replying' | 'ready') => void,
     ): Promise<void> {
         console.log(`[AgentClients] ${this.name} mentioned by ${msg.senderName}: "${msg.content.slice(0, 50)}"`)
@@ -226,7 +226,21 @@ class AgentClient {
 
             if (this.contextEngine && this.storage) {
                 try {
+                    console.log(`[AgentClients] ${this.name}: building context...`)
                     onStatus?.('compressing')
+                    // Get room members with descriptions for context
+                    const roomMembers: Array<{ userId: string; name: string; description: string }> = this.storage.getRoomMembers(roomId) || []
+                    const memberNames = roomMembers.map((m: any) => m.name)
+                    const members = roomMembers.map((m: any) => ({ userId: m.userId, name: m.name, description: m.description }))
+
+                    // Get room compression config
+                    const roomInfo = this.storage.getRoom(roomId)
+                    const compression = roomInfo ? {
+                        triggerTokens: roomInfo.triggerTokens,
+                        maxHistoryTokens: roomInfo.maxHistoryTokens,
+                        tailMessageCount: roomInfo.tailMessageCount,
+                    } : undefined
+
                     const ctx = await this.contextEngine.buildContext({
                         roomId,
                         agentId: this.agentId,
@@ -234,13 +248,16 @@ class AgentClient {
                         agentDescription: this.description,
                         agentSocketId: this.socket?.id || '',
                         roomName: roomId,
-                        memberNames: [],
+                        memberNames,
+                        members,
                         upstream,
                         apiKey,
                         currentMessage: msg,
+                        compression,
                     })
                     conversationHistory = ctx.conversationHistory
                     instructions = ctx.instructions
+                    console.log(`[AgentClients] ${this.name}: context built — historyLen=${conversationHistory.length}, meta=`, JSON.stringify(ctx.meta))
                     onStatus?.('replying')
                 } catch (err: any) {
                     console.warn(`[AgentClients] ${this.name}: context engine failed: ${err.message}`)
@@ -248,6 +265,9 @@ class AgentClient {
                     // Degrade: continue without context
                 }
             }
+
+            // Strip @mention from input — agent already knows it was mentioned
+            const input = msg.content.replace(new RegExp(`@${this.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'gi'), '').trim() || msg.content
 
             // Start a run on Hermes gateway
             const runRes = await fetch(`${upstream}/v1/runs`, {
@@ -257,7 +277,7 @@ class AgentClient {
                     ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
                 },
                 body: JSON.stringify({
-                    input: msg.content,
+                    input,
                     session_id: sessionId,
                     ...(conversationHistory.length > 0 ? { conversation_history: conversationHistory } : {}),
                     ...(instructions ? { instructions } : {}),
@@ -334,6 +354,7 @@ class AgentClient {
         } catch (err: any) {
             console.error(`[AgentClients] ${this.name}: error handling message: ${err.message}`)
             this.stopTyping(roomId)
+            this.deleteSession(sessionId).catch(() => { })
             onStatus?.('ready')
         }
     }
@@ -386,7 +407,7 @@ export class AgentClients {
 
     // Per-room processing lock + mention queue
     private _processingRooms = new Set<string>()
-    private _mentionQueue = new Map<string, Array<{ agent: AgentClient; msg: { content: string; senderName: string; senderId: string } }>>()
+    private _mentionQueue = new Map<string, Array<{ agent: AgentClient; msg: { content: string; senderName: string; senderId: string; timestamp: number } }>>()
 
     /**
      * Create an agent client and connect it to the server.
@@ -555,30 +576,18 @@ export class AgentClients {
      * Server-side: parse @mentions and forward to matching agents directly.
      * If the room is already processing (compressing/replying), queue the mention.
      */
-    async processMentions(roomId: string, msg: { content: string; senderName: string; senderId: string }): Promise<void> {
+    async processMentions(roomId: string, msg: { content: string; senderName: string; senderId: string; timestamp: number }): Promise<void> {
         if (!this._gatewayManager) return
 
         const content = msg.content.toLowerCase()
         const agents = this.getAgents(roomId)
 
-        for (const agent of agents) {
-            if (!content.includes(`@${agent.name.toLowerCase()}`)) continue
-            console.log(`[AgentClients] ${agent.name} mentioned by ${msg.senderName}`)
+        const mentioned = agents.filter(a => content.includes(`@${a.name.toLowerCase()}`))
+        if (mentioned.length === 0) return
 
-            // If room is processing, queue the mention
-            if (this._processingRooms.has(roomId)) {
-                console.log(`[AgentClients] room ${roomId} is processing, queuing mention for ${agent.name}`)
-                let queue = this._mentionQueue.get(roomId)
-                if (!queue) {
-                    queue = []
-                    this._mentionQueue.set(roomId, queue)
-                }
-                queue.push({ agent, msg })
-                continue
-            }
+        console.log(`[AgentClients] ${mentioned.map(a => a.name).join(', ')} mentioned by ${msg.senderName}`)
 
-            // Process immediately
-            this._processingRooms.add(roomId)
+        for (const agent of mentioned) {
             this._processAgentMention(roomId, agent, msg).catch((err) => {
                 console.error(`[AgentClients] error processing mention for ${agent.name}: ${err.message}`)
             })
@@ -591,8 +600,22 @@ export class AgentClients {
     private async _processAgentMention(
         roomId: string,
         agent: AgentClient,
-        msg: { content: string; senderName: string; senderId: string },
+        msg: { content: string; senderName: string; senderId: string; timestamp: number },
     ): Promise<void> {
+        const agentKey = `${roomId}:${agent.name}`
+        if (this._processingRooms.has(agentKey)) {
+            // Queue for this specific agent
+            let queue = this._mentionQueue.get(agentKey)
+            if (!queue) {
+                queue = []
+                this._mentionQueue.set(agentKey, queue)
+            }
+            queue.push({ agent, msg })
+            console.log(`[AgentClients] agent ${agent.name} is processing, queued mention in room ${roomId}`)
+            return
+        }
+
+        this._processingRooms.add(agentKey)
         const onStatus = (status: 'compressing' | 'replying' | 'ready') => {
             this._nsp?.to(roomId).emit('context_status', {
                 roomId,
@@ -605,24 +628,24 @@ export class AgentClients {
         try {
             await agent.replyToMention(roomId, msg, onStatus)
         } finally {
-            this._processingRooms.delete(roomId)
-            await this._drainQueue(roomId)
+            this._processingRooms.delete(agentKey)
+            await this._drainQueue(agentKey, roomId)
         }
     }
 
     /**
      * Drain queued mentions for a room after processing completes.
      */
-    private async _drainQueue(roomId: string): Promise<void> {
-        const queue = this._mentionQueue.get(roomId)
+    private async _drainQueue(agentKey: string, roomId: string): Promise<void> {
+        const queue = this._mentionQueue.get(agentKey)
         if (!queue || queue.length === 0) return
 
-        this._mentionQueue.delete(roomId)
-        console.log(`[AgentClients] draining ${queue.length} queued mention(s) for room ${roomId}`)
+        this._mentionQueue.delete(agentKey)
+        console.log(`[AgentClients] draining ${queue.length} queued mention(s) for ${agentKey}`)
 
         // Process the last queued mention only (most recent, discards stale intermediate ones)
         const last = queue[queue.length - 1]
-        this._processingRooms.add(roomId)
+        this._processingRooms.add(agentKey)
         this._processAgentMention(roomId, last.agent, last.msg).catch((err) => {
             console.error(`[AgentClients] error processing queued mention: ${err.message}`)
         })

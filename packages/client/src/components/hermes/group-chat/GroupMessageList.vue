@@ -45,6 +45,7 @@ defineExpose({ scrollToBottom })
             :key="msg.id"
             :message="msg"
             :agents="store.agents"
+            :current-user-id="store.userId"
         />
     </div>
 </template>

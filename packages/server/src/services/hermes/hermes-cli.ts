@@ -1,7 +1,20 @@
 import { execFile, spawn } from 'child_process'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import { promisify } from 'util'
+import { join, resolve } from 'path'
+import { homedir } from 'os'
 import { logger } from '../logger'
+
+const HERMES_BASE = resolve(homedir(), '.hermes')
+
+function getCurrentProfileName(): string {
+  try {
+    const name = readFileSync(join(HERMES_BASE, 'active_profile'), 'utf-8').trim()
+    return name || 'default'
+  } catch {
+    return 'default'
+  }
+}
 
 const execFileAsync = promisify(execFile)
 
@@ -195,8 +208,36 @@ export async function getSession(id: string): Promise<HermesSession | null> {
 /**
  * Delete a session from Hermes CLI
  */
-export async function deleteSession(id: string): Promise<boolean> {
+export async function deleteSession(id: string, profile?: string): Promise<boolean> {
   try {
+    if (profile) {
+      // Read current profile, switch to target, delete, then switch back
+      const activeName = getCurrentProfileName()
+
+      if (activeName !== profile) {
+        await execFileAsync(HERMES_BIN, ['profile', 'use', profile], {
+          timeout: 5000,
+          ...execOpts,
+        })
+      }
+
+      try {
+        await execFileAsync(HERMES_BIN, ['sessions', 'delete', id, '--yes'], {
+          timeout: 10000,
+          ...execOpts,
+        })
+      } finally {
+        // Always switch back to the original profile
+        if (activeName !== profile) {
+          await execFileAsync(HERMES_BIN, ['profile', 'use', activeName], {
+            timeout: 5000,
+            ...execOpts,
+          })
+        }
+      }
+      return true
+    }
+
     await execFileAsync(HERMES_BIN, ['sessions', 'delete', id, '--yes'], {
       timeout: 10000,
       ...execOpts,

@@ -1,15 +1,21 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import multiavatar from '@multiavatar/multiavatar'
 import MarkdownRenderer from '../chat/MarkdownRenderer.vue'
 import type { ChatMessage, RoomAgent } from '@/api/hermes/group-chat'
 
 const props = defineProps<{
     message: ChatMessage
     agents: RoomAgent[]
+    currentUserId?: string
 }>()
 
 const isAgent = computed(() => {
     return props.agents.some(a => a.agentId === props.message.senderId)
+})
+
+const isSelf = computed(() => {
+    return !!props.currentUserId && props.message.senderId === props.currentUserId
 })
 
 const agentInfo = computed(() => {
@@ -21,27 +27,16 @@ const timeStr = computed(() => {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 })
 
-const initials = computed(() => {
-    const name = props.message.senderName
-    return name.slice(0, 2).toUpperCase()
-})
-
-// Deterministic color from senderId
-const avatarColor = computed(() => {
-    let hash = 0
-    for (let i = 0; i < props.message.senderId.length; i++) {
-        hash = props.message.senderId.charCodeAt(i) + ((hash << 5) - hash)
-    }
-    const hue = Math.abs(hash) % 360
-    return `hsl(${hue}, 35%, 45%)`
+const avatarSvg = computed(() => {
+    return multiavatar(props.message.senderName || props.message.senderId)
 })
 </script>
 
 <template>
-    <div class="group-message" :class="{ agent: isAgent }">
+    <div class="group-message" :class="{ agent: isAgent, self: isSelf }">
         <!-- Avatar -->
-        <div class="avatar" :style="{ backgroundColor: avatarColor }">
-            {{ initials }}
+        <div class="avatar">
+            <span v-html="avatarSvg" />
         </div>
 
         <div class="msg-body">
@@ -65,7 +60,8 @@ const avatarColor = computed(() => {
     gap: 10px;
     padding: 2px 0;
 
-    &.agent {
+    &.agent,
+    &.self {
         flex-direction: row-reverse;
 
         .msg-body {
@@ -75,24 +71,29 @@ const avatarColor = computed(() => {
         .msg-header {
             flex-direction: row-reverse;
         }
+    }
 
-        .msg-content.agent-content {
-            background-color: rgba(var(--accent-primary-rgb), 0.06);
-        }
+    &.agent .msg-content.agent-content {
+        background-color: rgba(var(--accent-primary-rgb), 0.06);
+    }
+
+    &.self .msg-content {
+        background-color: rgba(var(--accent-primary-rgb), 0.1);
     }
 }
 
 .avatar {
     width: 36px;
     height: 36px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 13px;
-    font-weight: 600;
-    color: #fff;
     flex-shrink: 0;
+    margin-top: 2px;
+    overflow: hidden;
+    border-radius: 8px;
+
+    :deep(svg) {
+        width: 36px;
+        height: 36px;
+    }
 }
 
 .msg-body {

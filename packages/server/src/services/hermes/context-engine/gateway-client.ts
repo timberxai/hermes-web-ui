@@ -1,3 +1,4 @@
+import { EventSource } from 'eventsource'
 import type { StoredMessage, GatewayCaller } from './types'
 import {
     buildSummarizationSystemPrompt,
@@ -22,7 +23,7 @@ export class GatewaySummarizer implements GatewayCaller {
         systemPrompt: string,
         messages: StoredMessage[],
         previousSummary?: string,
-    ): Promise<string> {
+    ): Promise<{ summary: string; sessionId: string }> {
         // Build conversation_history from messages
         const history: Array<{ role: string; content: string }> = messages.map(m => ({
             role: 'user',
@@ -67,9 +68,9 @@ export class GatewaySummarizer implements GatewayCaller {
 
         try {
             const output = await this.pollForResult(upstream, apiKey, run_id)
-            return output
+            return { summary: output, sessionId }
         } finally {
-            // Note: no session cleanup needed — Hermes manages sessions internally
+            // Note: session cleanup is handled by the caller (compressor.ts)
         }
     }
 
