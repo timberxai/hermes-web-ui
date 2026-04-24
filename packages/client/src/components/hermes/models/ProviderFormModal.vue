@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, computed, onMounted } from 'vue'
-import { NModal, NForm, NFormItem, NInput, NButton, NSelect, useMessage } from 'naive-ui'
+import { NModal, NForm, NFormItem, NInput, NInputNumber, NButton, NSelect, useMessage } from 'naive-ui'
 import { useModelsStore } from '@/stores/hermes/models'
 import { useI18n } from 'vue-i18n'
 import CodexLoginModal from './CodexLoginModal.vue'
@@ -29,7 +29,7 @@ const formData = ref({
   base_url: '',
   api_key: '',
   model: '',
-  context_length: '',
+  context_length: null as number | null,
 })
 
 const modelOptions = ref<Array<{ label: string; value: string }>>([])
@@ -76,7 +76,7 @@ watch(() => formData.value.base_url, (url) => {
 
 watch(providerType, () => {
   modelOptions.value = []
-  formData.value = { name: '', base_url: '', api_key: '', model: '', context_length: '' }
+  formData.value = { name: '', base_url: '', api_key: '', model: '', context_length: null }
   selectedPreset.value = null
 })
 
@@ -155,7 +155,7 @@ async function handleSave() {
       ? selectedPreset.value
       : null
 
-    const contextLength = formData.value.context_length ? parseInt(formData.value.context_length, 10) : undefined
+    const contextLength = formData.value.context_length ?? undefined
     await modelsStore.addProvider({
       name: formData.value.name.trim(),
       base_url: formData.value.base_url.trim(),
@@ -275,10 +275,12 @@ function handleClose() {
       </NFormItem>
 
       <NFormItem v-if="providerType === 'custom'" :label="t('models.contextLength')">
-        <NInput
-          v-model:value="formData.context_length"
+        <NInputNumber
+          v-model:value="formData.context_length as number | null"
           :placeholder="t('models.contextLengthPlaceholder')"
-          type="number"
+          :min="0"
+          clearable
+          style="width: 100%"
         />
       </NFormItem>
     </NForm>
