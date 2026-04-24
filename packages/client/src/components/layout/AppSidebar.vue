@@ -9,14 +9,9 @@ import ProfileSelector from "./ProfileSelector.vue";
 import LanguageSwitch from "./LanguageSwitch.vue";
 import ThemeSwitch from "./ThemeSwitch.vue";
 import { useSessionSearch } from '@/composables/useSessionSearch'
-import danceVideoLight from "@/assets/dance-light.mp4";
-import danceVideoDark from "@/assets/dance-dark.mp4";
-
-import { useTheme } from "@/composables/useTheme";
 import { changelog } from "@/data/changelog";
 
 const { t } = useI18n();
-const { isDark } = useTheme();
 const message = useMessage();
 const route = useRoute();
 const router = useRouter();

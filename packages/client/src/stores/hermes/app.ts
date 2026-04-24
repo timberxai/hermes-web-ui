@@ -58,7 +58,13 @@ export const useAppStore = defineStore('app', () => {
   async function loadModels() {
     try {
       const res = await fetchConfigModels()
-      modelGroups.value = res.groups
+      modelGroups.value = res.groups.map(g => ({
+        provider: g.provider,
+        label: g.provider,
+        base_url: '',
+        models: g.models.map(m => typeof m === 'string' ? m : m.id),
+        api_key: '',
+      }))
       selectedModel.value = res.default
       selectedProvider.value = ''
     } catch {
