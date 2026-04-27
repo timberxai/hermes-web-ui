@@ -7,6 +7,9 @@ services:
       - hermes-agent-src:/opt/hermes
     environment:
       - HERMES_HOME=/home/agent/.hermes
+    # 让 hermes-agent 容器只跑 gateway，不再依赖 web-ui spawn
+    # 注释掉则沿用镜像默认 ENTRYPOINT
+    command: ["/opt/hermes/.venv/bin/hermes", "gateway", "run", "--replace"]
     stdin_open: true
     tty: true
     restart: unless-stopped
@@ -17,24 +20,26 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        BASE_IMAGE: ${HERMES_AGENT_IMAGE:-nousresearch/hermes-agent:latest}
     image: ${WEBUI_IMAGE:-hermes-web-ui-local:latest}
     container_name: ${WEBUI_CONTAINER_NAME:-hermes-webui}
-    entrypoint: ["node", "dist/server/index.js"]
     depends_on:
       - hermes-agent
     ports:
       - "${PORT:-6060}:${PORT:-6060}"
     volumes:
+      # 与 hermes-agent 共享数据卷（sessions DB / config / auth / logs）
       - ${HERMES_DATA_DIR:-./hermes_data}:/home/agent/.hermes
+      # web-ui 自身状态（token、上传缓存）
       - ${HERMES_DATA_DIR:-./hermes_data}/hermes-web-ui:/home/agent/.hermes-web-ui
-      - hermes-agent-src:/opt/hermes
+      # 共享 hermes 安装目录（包含 .venv/bin/hermes CLI）
+      - hermes-agent-src:/opt/hermes:ro
     environment:
       - PORT=${PORT:-6060}
       - UPSTREAM=${UPSTREAM:-http://hermes-agent:8642}
       - HERMES_HOME=/home/agent/.hermes
       - HERMES_BIN=${HERMES_BIN:-/opt/hermes/.venv/bin/hermes}
+      # 关键：声明 gateway 由 hermes-agent 容器外部管理，本进程不 spawn / kill gateway
+      - HERMES_GATEWAY_MANAGED_EXTERNALLY=1
       - AUTH_DISABLED=${AUTH_DISABLED:-false}
     restart: unless-stopped
 

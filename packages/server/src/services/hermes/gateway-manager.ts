@@ -54,6 +54,11 @@ const isWsl = existsSync('/proc/version') && readFileSync('/proc/version', 'utf-
 const isDocker = existsSync('/.dockerenv')
 const needsRunMode = isWsl || isDocker
 
+// Externally-managed mode: gateway 跑在另一个容器里，本进程绝不 spawn / kill gateway，
+// 仅做健康检查与状态注册。配合双容器部署使用（hermes-agent 容器 + hermes-web-ui 容器）。
+const externallyManaged = process.env.HERMES_GATEWAY_MANAGED_EXTERNALLY === '1'
+  || process.env.HERMES_GATEWAY_MANAGED_EXTERNALLY === 'true'
+
 // ============================
 // 类型定义
 // ============================
@@ -307,6 +312,12 @@ export class GatewayManager {
 
   /** 获取指定 profile 的网关 URL（代理路由使用） */
   getUpstream(profileName?: string): string {
+    // 外部托管模式下网关跑在另一个容器里，本地 profile 配置（127.0.0.1:8642）
+    // 与实际网关位置不一致，readProfilePort 的回退会把代理打到本机空端口。
+    // 优先用编排系统注入的 UPSTREAM env（同容器内的 config.upstream）。
+    if (externallyManaged && process.env.UPSTREAM) {
+      return process.env.UPSTREAM.replace(/\/$/, '')
+    }
     const name = profileName || this.activeProfile
     const gw = this.gateways.get(name)
     if (gw?.url) return gw.url
@@ -316,6 +327,12 @@ export class GatewayManager {
 
   /** 读取 profile 的 API_SERVER_KEY（从 .env 文件） */
   getApiKey(profileName?: string): string | null {
+    // 外部托管模式：编排系统通过 UPSTREAM_API_KEY env 注入 gateway 凭证，
+    // 因为 sidecar 没挂载 hermes 数据卷，读不到本地 .env。env 优先级最高，
+    // 本地文件作为非托管场景的回退。
+    if (process.env.UPSTREAM_API_KEY) {
+      return process.env.UPSTREAM_API_KEY
+    }
     const name = profileName || this.activeProfile
     try {
       const envPath = join(this.profileDir(name), '.env')
@@ -409,6 +426,13 @@ export class GatewayManager {
     const hermesHome = this.profileDir(name)
     const url = `http://${host}:${port}`
 
+    if (externallyManaged) {
+      // Gateway 由外部（另一个容器 / 编排系统）管理，本进程不 spawn。
+      // 只等待健康检查通过即可——网关健康即视为已"启动"。
+      logger.info('Gateway for profile "%s" is externally managed; waiting for health (port: %d)', name, port)
+      return this.waitForReady(name, 0, port, host, url)
+    }
+
     if (needsRunMode) {
       // WSL / Docker：无 systemd/launchd，用 "gateway run" 作为 detached 子进程
       return new Promise((resolve, reject) => {
@@ -488,6 +512,14 @@ export class GatewayManager {
       return `http://${host}:${port}`
     })()
 
+    if (externallyManaged) {
+      // 外部托管模式：不 kill 远端 gateway 进程，只从本地状态移除。
+      // 用户若需真正停止，应通过编排系统（docker stop hermes-<user>）处理。
+      this.gateways.delete(name)
+      logger.info('Gateway for profile "%s" is externally managed; only clearing local state', name)
+      return
+    }
+
     if (!needsRunMode) {
       // 正常系统：通过 hermes CLI 停止系统服务
       try {
@@ -561,6 +593,25 @@ export class GatewayManager {
    */
   async startAll(): Promise<void> {
     const profiles = await this.listProfiles()
+
+    if (externallyManaged) {
+      // 外部托管模式：不自己启动任何网关，仅对每个 profile 做一次健康检查尝试。
+      // detectAllOnStartup 已在 bootstrap 中调用，这里重复 detect 一次以应对慢启动的远端 gateway。
+      logger.info('Externally managed mode: skipping gateway spawn for %d profile(s)', profiles.length)
+      await Promise.allSettled(profiles.map(async (name) => {
+        try {
+          const { port, host } = this.readProfilePort(name)
+          const url = `http://${host}:${port}`
+          if (await this.checkHealth(url, 2000)) {
+            this.gateways.set(name, { pid: 0, port, host, url })
+            logger.info('%s: external gateway healthy at %s', name, url)
+          }
+        } catch (err) {
+          logger.debug('%s: external gateway not yet reachable', name)
+        }
+      }))
+      return
+    }
 
     // Phase 1: 顺序处理
     const toStart: string[] = []

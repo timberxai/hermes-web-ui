@@ -7,6 +7,8 @@ const execFileAsync = promisify(execFile)
 
 const execOpts = { windowsHide: true }
 const isDocker = existsSync('/.dockerenv')
+const externallyManaged = process.env.HERMES_GATEWAY_MANAGED_EXTERNALLY === '1'
+  || process.env.HERMES_GATEWAY_MANAGED_EXTERNALLY === 'true'
 
 function resolveHermesBin(): string {
   const envBin = process.env.HERMES_BIN?.trim()
@@ -246,6 +248,9 @@ export async function getVersion(): Promise<string> {
  * Start Hermes gateway (uses launchd/systemd)
  */
 export async function startGateway(): Promise<string> {
+  if (externallyManaged) {
+    return 'Gateway is externally managed; start is a no-op'
+  }
   if (isDocker) {
     const pid = await startGatewayBackground()
     return pid ? `Gateway started (PID: ${pid})` : 'Gateway start triggered'
@@ -276,6 +281,9 @@ export async function startGatewayBackground(): Promise<number | null> {
  * Restart Hermes gateway
  */
 export async function restartGateway(): Promise<string> {
+  if (externallyManaged) {
+    return 'Gateway is externally managed; restart must be triggered by the orchestrator (e.g. docker restart hermes-<user>)'
+  }
   if (isDocker) {
     try { await stopGateway() } catch { }
     const pid = await startGatewayBackground()
@@ -293,6 +301,9 @@ export async function restartGateway(): Promise<string> {
  * Stop Hermes gateway
  */
 export async function stopGateway(): Promise<string> {
+  if (externallyManaged) {
+    return 'Gateway is externally managed; stop is a no-op'
+  }
   const { stdout, stderr } = await execFileAsync(HERMES_BIN, ['gateway', 'stop'], {
     timeout: 30000,
     ...execOpts,
