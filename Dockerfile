@@ -1,70 +1,45 @@
-# Hermes Web UI — 独立容器（不 FROM hermes-agent）
+# hermes-web-ui sidecar image — runs the chat UI (node server + Caddy) as
+# a sidecar to a hermes-agent container. Inherits from hermes-agent so the
+# `hermes` binary is present in $PATH (needed by hermes-cli.ts for the CLI
+# fallback and the sqlite readers that hit state.db directly).
 #
-# 本 Dockerfile 不再继承 hermes-agent 镜像，改为纯 Node 23 base。
-# hermes 二进制与 ~/.hermes 数据目录通过 volume 在运行时由 hermes-agent 容器注入：
-#   -v hermes-agent-src:/opt/hermes
-#   -v hermes-data:/home/agent/.hermes
-# 配合 env HERMES_GATEWAY_MANAGED_EXTERNALLY=1 禁用本容器内 spawn gateway。
+# Closeclaw pairs this with a hermes-{user} container and mounts the same
+# user data directory (/home/agent/.hermes) into both, so sessions.db /
+# .env / skills are shared. No gateway is spawned here —
+# HERMES_GATEWAY_MANAGED_EXTERNALLY=1 keeps the web-ui deferring to the
+# gateway in the sibling container (reachable via UPSTREAM env).
 #
-# 优点：web-ui 镜像版本与 hermes-agent 镜像版本完全解耦，互不影响升级节奏。
+# Layout inside container:
+#   6060  node web-ui        (HTTP, internal)
+#   6443  Caddy TLS → 6060   (mapped to host webui_port, HTTPS)
 
-FROM node:23-bookworm-slim AS builder
+ARG BASE_IMAGE=nousresearch/hermes-agent:latest
+FROM ${BASE_IMAGE}
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    python3 \
-    make \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
+USER root
 
+# Node 23.11 + Caddy 2.9.1 + tini + native-build deps for node-pty etc.
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+      ca-certificates curl tar tini xz-utils python3 make g++ \
+ && curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.9.1/caddy_2.9.1_linux_amd64.tar.gz" \
+    | tar xz -C /usr/local/bin caddy \
+ && chmod +x /usr/local/bin/caddy \
+ && curl -fsSL "https://nodejs.org/dist/v23.11.0/node-v23.11.0-linux-x64.tar.xz" \
+    | tar xJ -C /usr/local --strip-components=1 \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Build hermes-web-ui from this repo's source.
 WORKDIR /app
-
 COPY package*.json ./
 RUN npm install --ignore-scripts
-
 COPY . .
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
-# ─── Runtime image ────────────────────────────────────────────
-FROM node:23-bookworm-slim AS runtime
-
-# node-pty 需要 libc / stdc++ 在运行时可用；slim 镜像已含
-# Caddy 用于 TLS 终止（6443 → 6060），与 hermes-admin 的 dashboard 同款。
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    tar \
-    tini \
-    && curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.9.1/caddy_2.9.1_linux_amd64.tar.gz" \
-       | tar xz -C /usr/local/bin caddy \
-    && chmod +x /usr/local/bin/caddy \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /app/package*.json ./
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/bin ./bin
-
-RUN npm prune --omit=dev
+# config.dataDir is hardcoded to /app/dist/data by upstream. Sticky-bit
+# world-writable so any UID the orchestrator runs us as can mkdir subdirs.
+RUN mkdir -p /app/dist/data && chmod 1777 /app/dist/data
 
 ENV NODE_ENV=production
-ENV HOME=/home/agent
-ENV HERMES_HOME=/home/agent/.hermes
-
-# Both /home/agent (HOME → server.log, .hermes-web-ui/) and /app/dist/data
-# (config.dataDir, hardcoded by upstream) must be writable by whatever UID
-# the orchestrator runs us as. Sticky-bit world-writable mirrors /tmp semantics
-# so arbitrary UIDs can mkdir subdirs without us baking in a fixed user.
-RUN mkdir -p /home/agent /app/dist/data && chmod 1777 /home/agent /app/dist/data
-# hermes CLI 由 /opt/hermes volume 注入（agent 容器共享）
-ENV HERMES_BIN=/opt/hermes/.venv/bin/hermes
-# gateway 不由本容器管理
-ENV HERMES_GATEWAY_MANAGED_EXTERNALLY=1
-# 默认上游 gateway 位置（docker-compose 场景下指向 hermes-agent 服务）
-ENV UPSTREAM=http://hermes-agent:8642
 
 COPY docker/caddy.Caddyfile /opt/caddy.Caddyfile
 COPY docker/start.sh /opt/start.sh
