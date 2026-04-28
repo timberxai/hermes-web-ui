@@ -2,10 +2,10 @@
 	auto_https off
 }
 
-# TLS termination on 9119 → reverse-proxy to local node server on 6060.
-# Mirrors the previous hermes-admin Caddy setup; closeclaw publishes this
-# port to the host (21000+) for chat UI access over HTTPS.
-:9119 {
+# TLS termination on 6443 → reverse-proxy to local node server on 6060.
+# Mirrors the hermes-admin Caddy setup (9119 → 9120) so closeclaw can publish
+# the chat UI on https://… via the same SSL volume.
+:6443 {
 	tls /etc/caddy/certs/cert.pem /etc/caddy/certs/cert.key
 
 	reverse_proxy 127.0.0.1:6060
