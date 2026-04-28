@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-IMAGE=hermes-web-ui
+IMAGE=hermes-admin
 DATE_TAG=$(date +%Y.%-m.%-d)
 
 docker build \
