@@ -31,14 +31,14 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process'
-import { resolve, join } from 'path'
-import { homedir } from 'os'
+import { join } from 'path'
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { createServer } from 'net'
 import yaml from 'js-yaml'
 import { logger } from '../logger'
+import { HERMES_BASE } from './hermes-profile'
 
 const execFileAsync = promisify(execFile)
 
@@ -46,7 +46,8 @@ const execFileAsync = promisify(execFile)
 // 常量 & 环境检测
 // ============================
 
-const HERMES_BASE = resolve(homedir(), '.hermes')
+// HERMES_BASE is shared from hermes-profile.ts so every module resolves the
+// data directory the same way (respecting $HERMES_HOME).
 const HERMES_BIN = process.env.HERMES_BIN?.trim() || 'hermes'
 
 // WSL / Docker 没有 systemd 或 launchd，需要用 "gateway run" 代替 "gateway start"

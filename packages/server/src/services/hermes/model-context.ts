@@ -1,9 +1,8 @@
 import { resolve, join } from 'path'
-import { homedir } from 'os'
 import { readFileSync, existsSync, statSync } from 'fs'
 import yaml from 'js-yaml'
+import { HERMES_BASE } from './hermes-profile'
 
-const HERMES_BASE = resolve(homedir(), '.hermes')
 const MODELS_DEV_CACHE = resolve(HERMES_BASE, 'models_dev_cache.json')
 const DEFAULT_CONTEXT_LENGTH = 200_000
 

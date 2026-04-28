@@ -2,12 +2,21 @@ import { resolve, join } from 'path'
 import { homedir } from 'os'
 import { readFileSync, existsSync } from 'fs'
 
-const HERMES_BASE = resolve(homedir(), '.hermes')
+// hermes agent honors $HERMES_HOME as the data directory (fall back to
+// ~/.hermes). web-ui must use the same resolution or it reads a stale /
+// empty tree — manifested as "Feishu config empty" in the UI and 500s on
+// /api/hermes/sessions because state.db / .env live under $HERMES_HOME,
+// not ~/.hermes. The single-container closeclaw deployment sets
+// HERMES_HOME=/opt/data, so this alignment is required.
+// Exported so other modules (model-context, gateway-manager) use the same
+// base instead of re-deriving from homedir() and silently diverging.
+export const HERMES_BASE = process.env.HERMES_HOME?.trim()
+  || resolve(homedir(), '.hermes')
 
 /**
  * Get the active profile's home directory.
- * default → ~/.hermes/
- * other   → ~/.hermes/profiles/{name}/
+ * default → $HERMES_HOME (or ~/.hermes)
+ * other   → $HERMES_HOME/profiles/{name}/
  */
 export function getActiveProfileDir(): string {
   const activeFile = join(HERMES_BASE, 'active_profile')
